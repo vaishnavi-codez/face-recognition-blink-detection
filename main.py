@@ -3,7 +3,7 @@ import numpy as np
 import cv2
 import os
 import re
-from collections import deque
+from anti_spoofing import ActiveLivenessChallenge, analyze_frame
 # =========================================================
 # LOAD KNOWN FACES
 # =========================================================
@@ -47,6 +47,36 @@ def eye_aspect_ratio(eye):
     B = np.linalg.norm(eye[2] - eye[4])
     C = np.linalg.norm(eye[0] - eye[3])
     return (A + B) / (2.0 * C) if C > 0 else 0
+
+def point_center(points):
+    pts = np.array(points, dtype=np.float32)
+    return tuple(np.mean(pts, axis=0))
+
+def build_liveness_landmarks(face_landmarks):
+    required = ["left_eye", "right_eye", "nose_tip", "top_lip", "chin"]
+    if not all(key in face_landmarks for key in required):
+        return None
+    top_lip = face_landmarks["top_lip"]
+    chin = face_landmarks["chin"]
+    if len(top_lip) < 7 or len(chin) < 9:
+        return None
+    return {
+        "left_eye": point_center(face_landmarks["left_eye"]),
+        "right_eye": point_center(face_landmarks["right_eye"]),
+        "nose_tip": point_center(face_landmarks["nose_tip"]),
+        "mouth_left": tuple(top_lip[0]),
+        "mouth_right": tuple(top_lip[6]),
+        "chin": tuple(chin[8]),
+    }
+
+def scale_landmarks(landmarks, factor=2):
+    if landmarks is None:
+        return None
+    return {key: (value[0] * factor, value[1] * factor) for key, value in landmarks.items()}
+
+def failed_check_names(decision):
+    failed = [check.name for check in decision.checks if not check.passed]
+    return ", ".join(failed[:2]) if failed else "challenge"
 # =========================================================
 # SMART CAMERA DETECTION
 # =========================================================
@@ -92,11 +122,9 @@ def real_time_system():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     EAR_THRESHOLD = 0.255
     CLOSED_FRAMES_THRESHOLD = 3
-    MOTION_THRESHOLD = 14.5
-    TEXTURE_THRESHOLD = 680
-    HISTORY_LEN = 25
     face_data = {}
     next_face_id = 0
+    previous_frame = None
     print("\n Press Q or ESC to exit\n")
     while True:
         ret, frame = cap.read()
@@ -124,8 +152,8 @@ def real_time_system():
                     "blink_count": 0,
                     "closed_frames": 0,
                     "state": "OPEN",
-                    "motion_history": deque(maxlen=HISTORY_LEN),
-                    "name": "Unknown"
+                    "name": "Unknown",
+                    "challenge": None
                 }
                 next_face_id += 1
             data = face_data[matched_id]
@@ -139,6 +167,7 @@ def real_time_system():
             live_person = True
             eyes_visible = False
             ear = 0.0
+            liveness_status = "Checking"
             if i < len(landmarks_list):
                 lm = landmarks_list[i]
                 if "left_eye" in lm and "right_eye" in lm:
@@ -149,19 +178,26 @@ def real_time_system():
                     eyes_visible = (left_w > 18 and right_w > 18)
                     if eyes_visible:
                         ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
-                    # Liveness Check
-                    face_crop = frame[top:bottom, left:right]
-                    if face_crop.size > 0:
-                        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                        small = cv2.resize(gray, (48, 48))
-                        data["motion_history"].append(small.copy())
-                        if len(data["motion_history"]) > 18:
-                            prev = data["motion_history"][-18]
-                            motion_score = np.mean(cv2.absdiff(prev, small))
-                            texture_var = np.var(small)
-                            if motion_score < MOTION_THRESHOLD or texture_var < TEXTURE_THRESHOLD:
-                                live_person = False
-                                static_count += 1
+                    liveness_landmarks = scale_landmarks(build_liveness_landmarks(lm))
+                    decision = analyze_frame(
+                        frame,
+                        (left, top, right - left, bottom - top),
+                        landmarks=liveness_landmarks,
+                        previous_frame_bgr=previous_frame,
+                    )
+                    if data["challenge"] is None and liveness_landmarks is not None:
+                        data["challenge"] = ActiveLivenessChallenge()
+                        data["challenge"].start(liveness_landmarks)
+                    challenge_passed = False
+                    if data["challenge"] is not None and liveness_landmarks is not None:
+                        challenge_passed = data["challenge"].update(liveness_landmarks)
+                    live_person = decision.live and challenge_passed
+                    if not live_person:
+                        static_count += 1
+                        if not decision.live:
+                            liveness_status = "Spoof: " + failed_check_names(decision)
+                        elif data["challenge"] is not None and data["challenge"].state is not None:
+                            liveness_status = "Do: " + data["challenge"].state.action.value
             # ===================== BLINK DETECTION =====================
             # Reset blink state for static images
             if not live_person:
@@ -184,7 +220,7 @@ def real_time_system():
                 status = "Blinking" if data["state"] == "CLOSED" else "Live"
                 color = (0, 0, 255) if data["state"] == "CLOSED" else (0, 255, 0)
             else:
-                status = "Static Image" if not live_person else "Eyes Not Visible"
+                status = liveness_status if not live_person else "Eyes Not Visible"
                 color = (255, 0, 255) if not live_person else (0, 165, 255)
             # Draw
             box_color = (0, 255, 0) if live_person else (0, 0, 255)
@@ -198,7 +234,7 @@ def real_time_system():
                 cv2.putText(frame, f"Blinks: {data['blink_count']}", (left, bottom+55),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             else:
-                cv2.putText(frame, "Static", (left, bottom+55),
+                cv2.putText(frame, "Rejected", (left, bottom+55),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         real_count = len(face_locations) - static_count
         cv2.putText(frame, f"Live Persons: {real_count}", (10, 35),
@@ -208,6 +244,7 @@ def real_time_system():
         if key in [ord('q'), ord('Q'), 27]:
             print(" Exiting...")
             break
+        previous_frame = frame.copy()
     cap.release()
     cv2.destroyAllWindows()
 def main():
